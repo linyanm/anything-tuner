@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Node version
+!.nvmrc
+
 # Build output
 dist/
 .vite/
