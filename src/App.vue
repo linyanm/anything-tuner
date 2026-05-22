@@ -1,4 +1,5 @@
 <script setup>
+import { PitchDetector } from "pitchy";
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 
 const tunings = [
@@ -84,7 +85,6 @@ const noteNames = [
   "Bb",
   "B",
 ];
-const meterTicks = [-50, -25, 0, 25, 50];
 const githubUrl = "https://github.com/linyanm/anything-tuner";
 const minimumSignalRms = 0.0008;
 const defaultNoiseFloor = 0.00035;
@@ -118,6 +118,7 @@ const isSupported = Boolean(navigator.mediaDevices?.getUserMedia);
 const audioState = reactive({
   context: null,
   analyser: null,
+  detector: null,
   source: null,
   preamp: null,
   stream: null,
@@ -134,33 +135,21 @@ const audioState = reactive({
 
 const activeTuning = computed(() => tunings[activeTuningIndex.value]);
 const targetString = computed(
-  () => activeTuning.value.strings[activeStringIndex.value],
+  () => activeTuning.value.strings[activeStringIndex.value] ?? ["--", 0],
 );
 const targetNote = computed(() => targetString.value[0]);
 const targetFrequency = computed(() => targetString.value[1]);
-const frequencyText = computed(() =>
-  detectedFrequency.value
-    ? `${detectedFrequency.value.toFixed(2)} Hz`
-    : "-- Hz",
-);
-const targetFrequencyText = computed(
-  () => `${targetFrequency.value.toFixed(2)} Hz`,
-);
 const selectedStringLabel = computed(
   () => `${activeTuning.value.strings.length - activeStringIndex.value} 弦`,
 );
-const inputLevelText = computed(() => `${Math.round(inputLevel.value * 100)}%`);
-const inputLevelStyle = computed(() => ({
-  transform: `scaleX(${inputLevel.value})`,
-}));
-const confidenceText = computed(() =>
-  pitchConfidence.value ? `${Math.round(pitchConfidence.value * 100)}%` : "--",
+const activeStringLabel = computed(
+  () => `${selectedStringLabel.value} ${targetNote.value}`,
 );
 const detectedNote = computed(() =>
   detectedFrequency.value ? frequencyToNote(detectedFrequency.value) : "--",
 );
 const cents = computed(() => {
-  if (!detectedFrequency.value) return null;
+  if (!detectedFrequency.value || !targetFrequency.value) return null;
   return 1200 * Math.log2(detectedFrequency.value / targetFrequency.value);
 });
 const closestString = computed(() => {
@@ -168,7 +157,7 @@ const closestString = computed(() => {
 
   return activeTuning.value.strings
     .map(([note, frequency], index) => ({
-      note,
+      note: note ?? "--",
       frequency,
       index,
       label: `${activeTuning.value.strings.length - index} 弦`,
@@ -188,7 +177,7 @@ const centsText = computed(() => {
   if (cents.value === null)
     return audioState.running ? "请拨响琴弦" : "等待输入";
   if (isDifferentString.value) {
-    return `疑似 ${closestString.value.label} ${closestString.value.note}`;
+    return `疑似 ${getStringDisplayName(closestString.value)}`;
   }
   const absCents = Math.abs(cents.value);
   if (absCents <= 5) return isTunedStable.value ? "已调准" : "保持中";
@@ -201,12 +190,11 @@ const tunerStateClass = computed(() => {
   if (Math.abs(cents.value) <= 5 && isTunedStable.value) return "is-good";
   return cents.value < 0 ? "is-flat" : "is-sharp";
 });
-const needleStyle = computed(() => {
-  if (cents.value === null)
-    return { transform: "translateX(-50%) rotate(0deg)" };
-  const clampedCents = Math.max(-50, Math.min(50, cents.value));
-  const rotation = (clampedCents / 50) * 42;
-  return { transform: `translateX(-50%) rotate(${rotation}deg)` };
+const meterPointerStyle = computed(() => {
+  const clampedCents =
+    cents.value === null ? 0 : Math.max(-50, Math.min(50, cents.value));
+  const offsetPercent = 50 + clampedCents;
+  return { left: `${offsetPercent}%` };
 });
 
 watch(activeTuningIndex, () => {
@@ -242,6 +230,11 @@ async function startTuner() {
     audioState.analyser.fftSize = 8192;
     audioState.analyser.smoothingTimeConstant = 0;
     audioState.buffer = new Float32Array(audioState.analyser.fftSize);
+    audioState.detector = PitchDetector.forFloat32Array(
+      audioState.buffer.length,
+    );
+    audioState.detector.clarityThreshold = 0.74;
+    audioState.detector.minVolumeAbsolute = 0;
 
     audioState.source = audioState.context.createMediaStreamSource(
       audioState.stream,
@@ -273,6 +266,7 @@ function stopTuner() {
   audioState.stream = null;
   audioState.context = null;
   audioState.analyser = null;
+  audioState.detector = null;
   audioState.source = null;
   audioState.preamp = null;
   audioState.lastAnalysisTime = 0;
@@ -291,13 +285,7 @@ function tick(timestamp = performance.now()) {
   if (timestamp - audioState.lastAnalysisTime >= 45) {
     audioState.lastAnalysisTime = timestamp;
     audioState.analyser.getFloatTimeDomainData(audioState.buffer);
-    const pitch = detectPitch(
-      audioState.buffer,
-      audioState.context.sampleRate,
-      targetFrequency.value,
-      activeTuning.value.strings,
-      activeStringIndex.value,
-    );
+    const pitch = detectPitch(audioState.buffer, audioState.context.sampleRate);
     inputLevel.value = pitch.level;
     pitchConfidence.value = pitch.confidence;
     const stablePitch = filterTargetOutlier(pitch.frequency, timestamp);
@@ -329,13 +317,11 @@ function getInputGain() {
   return isSafari ? 18 : 3;
 }
 
-function detectPitch(
-  buffer,
-  sampleRate,
-  targetFrequencyValue,
-  tuningStrings,
-  targetStringIndex,
-) {
+function detectPitch(buffer, sampleRate) {
+  if (!audioState.detector) {
+    return { frequency: null, confidence: 0, level: 0 };
+  }
+
   const workingBuffer = new Float32Array(buffer.length);
   let mean = 0;
   for (const sample of buffer) {
@@ -360,87 +346,48 @@ function detectPitch(
     workingBuffer[index] /= rms;
   }
 
-  const minFrequency = 55;
-  const maxFrequency = 430;
-  const minimumCorrelation = getMinimumCorrelation(rms);
-  const minLag = Math.floor(sampleRate / maxFrequency);
-  const maxLag = Math.min(
-    buffer.length - 1,
-    Math.ceil(sampleRate / minFrequency),
+  const [frequency, clarity] = audioState.detector.findPitch(
+    workingBuffer,
+    sampleRate,
   );
-  const candidates = [];
-
-  for (let lag = minLag; lag <= maxLag; lag += 1) {
-    let correlation = 0;
-    let energy = 0;
-    const compareLength = buffer.length - lag;
-    for (let index = 0; index < compareLength; index += 1) {
-      const sampleA = workingBuffer[index];
-      const sampleB = workingBuffer[index + lag];
-      correlation += sampleA * sampleB;
-      energy += sampleA * sampleA + sampleB * sampleB;
-    }
-
-    const normalizedCorrelation = energy > 0 ? (2 * correlation) / energy : 0;
-    if (normalizedCorrelation < minimumCorrelation) continue;
-
-    const previousLag = Math.max(minLag, lag - 1);
-    const nextLag = Math.min(maxLag, lag + 1);
-    let previousCorrelation = normalizedCorrelation;
-    let nextCorrelation = normalizedCorrelation;
-
-    if (previousLag !== lag) {
-      previousCorrelation = normalizedCorrelationForLag(
-        workingBuffer,
-        previousLag,
-      );
-    }
-    if (nextLag !== lag) {
-      nextCorrelation = normalizedCorrelationForLag(workingBuffer, nextLag);
-    }
-
-    if (
-      normalizedCorrelation >= previousCorrelation &&
-      normalizedCorrelation >= nextCorrelation
-    ) {
-      const denominator =
-        previousCorrelation - 2 * normalizedCorrelation + nextCorrelation;
-      const shift =
-        Math.abs(denominator) > 0.000001
-          ? (previousCorrelation - nextCorrelation) / (2 * denominator)
-          : 0;
-      const refinedLag = lag + Math.max(-0.5, Math.min(0.5, shift));
-      const frequency = sampleRate / refinedLag;
-      const closestTuningMatch = getClosestTuningMatch(
-        frequency,
-        tuningStrings,
-      );
-      candidates.push({
-        frequency,
-        confidence: normalizedCorrelation,
-        lag: refinedLag,
-        centsFromTarget: Math.abs(
-          1200 * Math.log2(frequency / targetFrequencyValue),
-        ),
-        centsFromTuning: closestTuningMatch.cents,
-        closestTuningIndex: closestTuningMatch.index,
-      });
-    }
+  if (!frequency || clarity < getMinimumClarity(rms)) {
+    return { frequency: null, confidence: clarity, level };
   }
 
-  if (!candidates.length) return { frequency: null, confidence: 0, level };
-
-  const bestCandidate = choosePitchCandidate(
-    candidates,
-    targetFrequencyValue,
-    minimumCorrelation,
-    targetStringIndex,
-  );
   return {
-    frequency: bestCandidate.frequency,
-    confidence: bestCandidate.confidence,
+    frequency: normalizeFrequencyToTargetOctave(frequency),
+    confidence: clarity,
     level,
   };
+}
+
+function normalizeFrequencyToTargetOctave(frequency) {
+  const target = targetFrequency.value;
+  const candidates = [frequency / 4, frequency / 2, frequency, frequency * 2]
+    .filter((candidate) => candidate >= 55 && candidate <= 430)
+    .map((candidate) => ({
+      frequency: candidate,
+      centsFromTarget: Math.abs(1200 * Math.log2(candidate / target)),
+    }))
+    .sort((candidateA, candidateB) => {
+      const distanceDifference =
+        candidateA.centsFromTarget - candidateB.centsFromTarget;
+      if (Math.abs(distanceDifference) > 8) return distanceDifference;
+      return candidateB.frequency - candidateA.frequency;
+    });
+
+  const originalDistance = Math.abs(1200 * Math.log2(frequency / target));
+  const bestCandidate = candidates[0];
+  if (
+    bestCandidate &&
+    bestCandidate.frequency !== frequency &&
+    bestCandidate.centsFromTarget <= 80 &&
+    originalDistance - bestCandidate.centsFromTarget >= 500
+  ) {
+    return bestCandidate.frequency;
+  }
+
+  return frequency;
 }
 
 function getClosestTuningMatch(frequency, tuningStrings) {
@@ -452,84 +399,9 @@ function getClosestTuningMatch(frequency, tuningStrings) {
     .sort((matchA, matchB) => matchA.cents - matchB.cents)[0];
 }
 
-function choosePitchCandidate(
-  candidates,
-  targetFrequencyValue,
-  minimumCorrelation,
-  targetStringIndex,
-) {
-  const strongestCandidate = candidates.reduce((bestCandidate, candidate) =>
-    candidate.confidence > bestCandidate.confidence ? candidate : bestCandidate,
-  );
-  const targetCandidate = candidates
-    .filter((candidate) => candidate.centsFromTarget <= 80)
-    .sort((candidateA, candidateB) => {
-      const confidenceDifference =
-        candidateB.confidence - candidateA.confidence;
-      if (Math.abs(confidenceDifference) > 0.02) return confidenceDifference;
-      return candidateA.centsFromTarget - candidateB.centsFromTarget;
-    })[0];
-  const tuningCandidate = candidates
-    .filter((candidate) => candidate.centsFromTuning <= 80)
-    .sort((candidateA, candidateB) => {
-      const tuningDistanceDifference =
-        candidateA.centsFromTuning - candidateB.centsFromTuning;
-      if (Math.abs(tuningDistanceDifference) > 12) {
-        return tuningDistanceDifference;
-      }
-      return candidateB.confidence - candidateA.confidence;
-    })[0];
-  const differentStringCandidate = candidates
-    .filter(
-      (candidate) =>
-        candidate.closestTuningIndex !== targetStringIndex &&
-        candidate.centsFromTuning <= 80 &&
-        candidate.centsFromTarget >= 180,
-    )
-    .sort(
-      (candidateA, candidateB) => candidateB.confidence - candidateA.confidence,
-    )[0];
-
-  if (
-    differentStringCandidate &&
-    differentStringCandidate.confidence >=
-      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.9)
-  ) {
-    return differentStringCandidate;
-  }
-
-  if (
-    targetCandidate &&
-    targetCandidate.confidence >=
-      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.82) &&
-    getOctaveDistanceInCents(
-      strongestCandidate.frequency,
-      targetFrequencyValue,
-    ) <= 90
-  ) {
-    return targetCandidate;
-  }
-
-  if (
-    tuningCandidate &&
-    tuningCandidate !== strongestCandidate &&
-    tuningCandidate.confidence >=
-      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.72) &&
-    getOctaveDistanceInCents(
-      tuningCandidate.frequency,
-      strongestCandidate.frequency,
-    ) <= 80
-  ) {
-    return tuningCandidate;
-  }
-
-  return strongestCandidate;
-}
-
-function getOctaveDistanceInCents(frequencyA, frequencyB) {
-  const absoluteCents = Math.abs(1200 * Math.log2(frequencyA / frequencyB));
-  const octaveRemainder = absoluteCents % 1200;
-  return Math.min(octaveRemainder, 1200 - octaveRemainder);
+function getStringDisplayName(string) {
+  if (!string) return "其他弦";
+  return `${string.label ?? "其他弦"} ${string.note ?? ""}`.trim();
 }
 
 function updateNoiseFloor(rms) {
@@ -545,11 +417,11 @@ function updateNoiseFloor(rms) {
   );
 }
 
-function getMinimumCorrelation(rms) {
-  if (rms < 0.004) return 0.42;
-  if (rms < 0.008) return 0.48;
-  if (rms < 0.016) return 0.56;
-  return 0.62;
+function getMinimumClarity(rms) {
+  if (rms < 0.004) return 0.52;
+  if (rms < 0.008) return 0.58;
+  if (rms < 0.016) return 0.64;
+  return 0.7;
 }
 
 function filterTargetOutlier(frequency, timestamp) {
@@ -611,19 +483,6 @@ function smoothDetectedFrequency(frequency, timestamp) {
   return detectedFrequency.value * 0.55 + frequency * 0.45;
 }
 
-function normalizedCorrelationForLag(buffer, lag) {
-  let correlation = 0;
-  let energy = 0;
-  const compareLength = buffer.length - lag;
-  for (let index = 0; index < compareLength; index += 1) {
-    const sampleA = buffer[index];
-    const sampleB = buffer[index + lag];
-    correlation += sampleA * sampleB;
-    energy += sampleA * sampleA + sampleB * sampleB;
-  }
-  return energy > 0 ? (2 * correlation) / energy : 0;
-}
-
 function updateTunedStability(hasFreshPitch, timestamp) {
   if (!hasFreshPitch || cents.value === null || isDifferentString.value) {
     if (timestamp - audioState.lastReliablePitchTime > pitchHoldDuration) {
@@ -658,7 +517,7 @@ function updateStatusFromPitch() {
     return;
   }
   if (isDifferentString.value) {
-    statusLine.value = `检测到 ${closestString.value.label} ${closestString.value.note}，不是当前选择的 ${selectedStringLabel.value} ${targetNote.value}。`;
+    statusLine.value = `检测到 ${getStringDisplayName(closestString.value)}，不是当前选择的 ${activeStringLabel.value}。`;
     return;
   }
   if (Math.abs(cents.value) <= 5) {
@@ -684,7 +543,8 @@ function resetPitch() {
 function frequencyToNote(frequency) {
   const noteNumber = Math.round(12 * Math.log2(frequency / 440) + 69);
   const octave = Math.floor(noteNumber / 12) - 1;
-  return `${noteNames[noteNumber % 12]}${octave}`;
+  const noteIndex = ((noteNumber % 12) + 12) % 12;
+  return `${noteNames[noteIndex] ?? "--"}${octave}`;
 }
 
 onBeforeUnmount(() => {
@@ -700,23 +560,6 @@ onBeforeUnmount(() => {
       aria-label="guitar tuner"
     >
       <header class="app-header">
-        <div class="brand-row">
-          <p class="eyebrow">Anything Tuner</p>
-          <a
-            class="source-link"
-            :href="githubUrl"
-            target="_blank"
-            rel="noreferrer"
-            aria-label="打开 GitHub 项目"
-            title="GitHub"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M12 2C6.48 2 2 6.58 2 12.24c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.49v-1.74c-2.78.62-3.37-1.37-3.37-1.37-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.05 0-1.12.39-2.03 1.03-2.74-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05A9.34 9.34 0 0 1 12 6.99c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.71 1.03 1.62 1.03 2.74 0 3.92-2.34 4.79-4.57 5.04.36.32.68.94.68 1.89v2.81c0 .27.18.59.69.49A10.2 10.2 0 0 0 22 12.24C22 6.58 17.52 2 12 2Z"
-              />
-            </svg>
-          </a>
-        </div>
         <div class="header-actions">
           <button
             class="icon-button"
@@ -729,16 +572,21 @@ onBeforeUnmount(() => {
             <span>{{ audioState.running ? "停止调音" : "开始调音" }}</span>
           </button>
         </div>
-      </header>
-
-      <div class="status-line" role="status">{{ statusLine }}</div>
-      <div class="input-monitor" aria-label="麦克风输入电平">
-        <span>输入 {{ inputLevelText }}</span>
-        <div class="input-meter" aria-hidden="true">
-          <span :style="inputLevelStyle"></span>
+        <div class="top-tools">
+          <section class="controls" aria-label="调音设置">
+            <label class="select-label" for="tuningSelect">调弦</label>
+            <select id="tuningSelect" v-model.number="activeTuningIndex">
+              <option
+                v-for="(tuning, index) in tunings"
+                :key="tuning.name"
+                :value="index"
+              >
+                {{ tuning.name }}
+              </option>
+            </select>
+          </section>
         </div>
-        <span>置信度 {{ confidenceText }}</span>
-      </div>
+      </header>
 
       <section class="headstock-preview" aria-label="琴头预览">
         <div class="headstock">
@@ -750,14 +598,14 @@ onBeforeUnmount(() => {
             class="headstock-string"
             :class="{
               active: index === activeStringIndex,
-              left: headstockLayout[index].side === 'left',
-              right: headstockLayout[index].side === 'right',
+              left: headstockLayout[index]?.side === 'left',
+              right: headstockLayout[index]?.side === 'right',
             }"
             type="button"
             :style="{
               '--string-index': index,
-              '--peg-slot': headstockLayout[index].slot,
-              '--peg-x': `${headstockLayout[index].x}px`,
+              '--peg-slot': headstockLayout[index]?.slot ?? 0,
+              '--peg-x': `${headstockLayout[index]?.x ?? 0}px`,
             }"
             :aria-label="`选择第 ${activeTuning.strings.length - index} 弦 ${note}`"
             @click="activeStringIndex = index"
@@ -775,96 +623,46 @@ onBeforeUnmount(() => {
 
       <section class="readout" aria-live="polite">
         <div class="meter" aria-hidden="true">
-          <div class="meter-status">{{ centsText }}</div>
-          <div class="meter-arc"></div>
-          <div class="meter-safe-zone"></div>
-          <div class="meter-ticks">
-            <span
-              v-for="tick in meterTicks"
-              :key="tick"
-              :style="{ '--tick-angle': `${(tick / 50) * 50}deg` }"
-            ></span>
+          <div class="meter-preview">
+            <span class="meter-mark meter-mark-flat">b</span>
+            <span class="meter-mark meter-mark-sharp">#</span>
+            <div class="meter-center-line"></div>
+            <div class="meter-pointer" :style="meterPointerStyle">
+              <span></span>
+            </div>
           </div>
-          <div class="meter-band">
-            <span
-              v-for="tick in meterTicks"
-              :key="`label-${tick}`"
-              :style="{ '--label-angle': `${(tick / 50) * 50}deg` }"
-            >
-              {{ tick > 0 ? `+${tick}` : tick }}
-            </span>
+          <div class="meter-readout">
+            <div class="meter-status">{{ centsText }}</div>
+            <div class="meter-center">
+              <span>目标 {{ targetNote }}</span>
+              <strong>{{ detectedNote }}</strong>
+            </div>
           </div>
-          <div class="meter-center">
-            <span>目标 {{ targetNote }}</span>
-            <strong>{{ detectedNote }}</strong>
-          </div>
-          <div class="needle" :style="needleStyle"></div>
-          <div class="needle-pivot"></div>
         </div>
         <div class="note-card">
           <div class="target-note">{{ targetNote }}</div>
           <div class="detected-note">{{ detectedNote }}</div>
           <div class="cents">{{ centsText }}</div>
         </div>
-        <div class="mobile-frequency-strip" aria-label="频率信息">
-          <div>
-            <span>当前</span>
-            <strong>{{ frequencyText }}</strong>
-          </div>
-          <div>
-            <span>目标</span>
-            <strong>{{ targetFrequencyText }}</strong>
-          </div>
-        </div>
       </section>
 
-      <section class="controls" aria-label="调音设置">
-        <label class="select-label" for="tuningSelect">调弦</label>
-        <select id="tuningSelect" v-model.number="activeTuningIndex">
-          <option
-            v-for="(tuning, index) in tunings"
-            :key="tuning.name"
-            :value="index"
-          >
-            {{ tuning.name }}
-          </option>
-        </select>
-
-        <div class="string-list" aria-label="琴弦">
-          <button
-            v-for="([note, frequency], index) in activeTuning.strings"
-            :key="`${note}-${frequency}`"
-            class="string-button"
-            :class="{ active: index === activeStringIndex }"
-            type="button"
-            @click="activeStringIndex = index"
-          >
-            <strong>{{ note }}</strong>
-            <span>
-              {{ activeTuning.strings.length - index }} 弦 ·
-              {{ frequency.toFixed(2) }} Hz
-            </span>
-          </button>
-        </div>
-      </section>
+      <footer class="app-footer">
+        <p class="eyebrow">Anything Tuner</p>
+        <a
+          class="source-link"
+          :href="githubUrl"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="打开 GitHub 项目"
+          title="GitHub"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M12 2C6.48 2 2 6.58 2 12.24c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.49v-1.74c-2.78.62-3.37-1.37-3.37-1.37-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.05 0-1.12.39-2.03 1.03-2.74-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05A9.34 9.34 0 0 1 12 6.99c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.71 1.03 1.62 1.03 2.74 0 3.92-2.34 4.79-4.57 5.04.36.32.68.94.68 1.89v2.81c0 .27.18.59.69.49A10.2 10.2 0 0 0 22 12.24C22 6.58 17.52 2 12 2Z"
+            />
+          </svg>
+        </a>
+      </footer>
     </section>
-
-    <aside class="side-panel" aria-label="使用状态">
-      <div class="frequency-card">
-        <span>当前频率</span>
-        <strong>{{ frequencyText }}</strong>
-      </div>
-      <div class="frequency-card">
-        <span>目标频率</span>
-        <strong>{{ targetFrequencyText }}</strong>
-      </div>
-      <div class="tips">
-        <h2>常用调弦</h2>
-        <p>
-          内置标准、降 D、全降半音、全降一音、开放
-          G、DADGAD，适合电吉他和木吉他。
-        </p>
-      </div>
-    </aside>
   </main>
 </template>
