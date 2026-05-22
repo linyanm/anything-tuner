@@ -88,7 +88,7 @@ const meterTicks = [-50, -25, 0, 25, 50];
 const githubUrl = "https://github.com/linyanm/anything-tuner";
 const minimumSignalRms = 0.0008;
 const defaultNoiseFloor = 0.00035;
-const comfortableSignalRms = 0.03;
+const comfortableSignalRms = 0.024;
 const browserUserAgent = navigator.userAgent.toLowerCase();
 const isSafari =
   browserUserAgent.includes("safari") &&
@@ -277,7 +277,7 @@ function getAudioConstraints() {
 }
 
 function getInputGain() {
-  return isSafari ? 10 : 3;
+  return isSafari ? 18 : 3;
 }
 
 function detectPitch(buffer, sampleRate, targetFrequencyValue) {
