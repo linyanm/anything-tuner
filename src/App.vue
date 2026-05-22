@@ -1,0 +1,396 @@
+<script setup>
+import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
+
+const tunings = [
+  {
+    name: "标准调弦",
+    strings: [
+      ["E2", 82.41],
+      ["A2", 110],
+      ["D3", 146.83],
+      ["G3", 196],
+      ["B3", 246.94],
+      ["E4", 329.63],
+    ],
+  },
+  {
+    name: "降 D",
+    strings: [
+      ["D2", 73.42],
+      ["A2", 110],
+      ["D3", 146.83],
+      ["G3", 196],
+      ["B3", 246.94],
+      ["E4", 329.63],
+    ],
+  },
+  {
+    name: "全降半音",
+    strings: [
+      ["Eb2", 77.78],
+      ["Ab2", 103.83],
+      ["Db3", 138.59],
+      ["Gb3", 185],
+      ["Bb3", 233.08],
+      ["Eb4", 311.13],
+    ],
+  },
+  {
+    name: "全降一音",
+    strings: [
+      ["D2", 73.42],
+      ["G2", 98],
+      ["C3", 130.81],
+      ["F3", 174.61],
+      ["A3", 220],
+      ["D4", 293.66],
+    ],
+  },
+  {
+    name: "开放 G",
+    strings: [
+      ["D2", 73.42],
+      ["G2", 98],
+      ["D3", 146.83],
+      ["G3", 196],
+      ["B3", 246.94],
+      ["D4", 293.66],
+    ],
+  },
+  {
+    name: "DADGAD",
+    strings: [
+      ["D2", 73.42],
+      ["A2", 110],
+      ["D3", 146.83],
+      ["G3", 196],
+      ["A3", 220],
+      ["D4", 293.66],
+    ],
+  },
+];
+
+const noteNames = [
+  "C",
+  "C#",
+  "D",
+  "Eb",
+  "E",
+  "F",
+  "F#",
+  "G",
+  "Ab",
+  "A",
+  "Bb",
+  "B",
+];
+const meterTicks = [-50, -25, 0, 25, 50];
+
+const activeTuningIndex = ref(0);
+const activeStringIndex = ref(0);
+const statusLine = ref("选择调弦后点击开始，允许浏览器使用麦克风。");
+const detectedFrequency = ref(null);
+const isSupported = Boolean(navigator.mediaDevices?.getUserMedia);
+const audioState = reactive({
+  context: null,
+  analyser: null,
+  stream: null,
+  buffer: null,
+  rafId: null,
+  running: false,
+});
+
+const activeTuning = computed(() => tunings[activeTuningIndex.value]);
+const targetString = computed(
+  () => activeTuning.value.strings[activeStringIndex.value],
+);
+const targetNote = computed(() => targetString.value[0]);
+const targetFrequency = computed(() => targetString.value[1]);
+const frequencyText = computed(() =>
+  detectedFrequency.value
+    ? `${detectedFrequency.value.toFixed(2)} Hz`
+    : "-- Hz",
+);
+const targetFrequencyText = computed(
+  () => `${targetFrequency.value.toFixed(2)} Hz`,
+);
+const detectedNote = computed(() =>
+  detectedFrequency.value ? frequencyToNote(detectedFrequency.value) : "--",
+);
+const cents = computed(() => {
+  if (!detectedFrequency.value) return null;
+  return 1200 * Math.log2(detectedFrequency.value / targetFrequency.value);
+});
+const centsText = computed(() => {
+  if (cents.value === null)
+    return audioState.running ? "请拨响琴弦" : "等待输入";
+  const absCents = Math.abs(cents.value);
+  if (absCents <= 5) return "已调准";
+  return cents.value < 0
+    ? `偏低 ${Math.round(absCents)} cents`
+    : `偏高 ${Math.round(absCents)} cents`;
+});
+const tunerStateClass = computed(() => {
+  if (cents.value === null) return "";
+  if (Math.abs(cents.value) <= 5) return "is-good";
+  return cents.value < 0 ? "is-flat" : "is-sharp";
+});
+const needleStyle = computed(() => {
+  if (cents.value === null)
+    return { transform: "translateX(-50%) rotate(0deg)" };
+  const clampedCents = Math.max(-50, Math.min(50, cents.value));
+  const rotation = (clampedCents / 50) * 42;
+  return { transform: `translateX(-50%) rotate(${rotation}deg)` };
+});
+
+watch(activeTuningIndex, () => {
+  activeStringIndex.value = 0;
+  resetPitch();
+});
+
+watch(activeStringIndex, resetPitch);
+
+if (!isSupported) {
+  statusLine.value = "当前浏览器不支持麦克风输入，请换用现代浏览器。";
+}
+
+async function toggleTuner() {
+  if (audioState.running) {
+    stopTuner();
+    return;
+  }
+  await startTuner();
+}
+
+async function startTuner() {
+  try {
+    audioState.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+    audioState.context = new AudioContext();
+    audioState.analyser = audioState.context.createAnalyser();
+    audioState.analyser.fftSize = 4096;
+    audioState.buffer = new Float32Array(audioState.analyser.fftSize);
+
+    const source = audioState.context.createMediaStreamSource(
+      audioState.stream,
+    );
+    source.connect(audioState.analyser);
+
+    audioState.running = true;
+    statusLine.value = "正在监听琴弦声音。";
+    tick();
+  } catch (error) {
+    statusLine.value = "无法使用麦克风，请检查浏览器权限或 HTTPS 环境。";
+  }
+}
+
+function stopTuner() {
+  audioState.running = false;
+  cancelAnimationFrame(audioState.rafId);
+  audioState.stream?.getTracks().forEach((track) => track.stop());
+  audioState.context?.close();
+  audioState.stream = null;
+  audioState.context = null;
+  audioState.analyser = null;
+  statusLine.value = "已停止监听。";
+  resetPitch();
+}
+
+function tick() {
+  if (!audioState.running || !audioState.analyser) return;
+  audioState.analyser.getFloatTimeDomainData(audioState.buffer);
+  detectedFrequency.value = detectPitch(
+    audioState.buffer,
+    audioState.context.sampleRate,
+  );
+  updateStatusFromPitch();
+  audioState.rafId = requestAnimationFrame(tick);
+}
+
+function detectPitch(buffer, sampleRate) {
+  let rms = 0;
+  for (const sample of buffer) {
+    rms += sample * sample;
+  }
+  rms = Math.sqrt(rms / buffer.length);
+  if (rms < 0.01) return null;
+
+  const minFrequency = 60;
+  const maxFrequency = 380;
+  const minLag = Math.floor(sampleRate / maxFrequency);
+  const maxLag = Math.min(
+    buffer.length - 1,
+    Math.ceil(sampleRate / minFrequency),
+  );
+  let bestLag = -1;
+  let bestCorrelation = 0;
+
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let correlation = 0;
+    for (let index = 0; index < buffer.length - lag; index += 1) {
+      correlation += buffer[index] * buffer[index + lag];
+    }
+    correlation /= buffer.length - lag;
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestLag = lag;
+    }
+  }
+
+  if (bestLag <= 0 || bestCorrelation < 0.002) return null;
+  return sampleRate / bestLag;
+}
+
+function updateStatusFromPitch() {
+  if (cents.value === null) {
+    statusLine.value = "请拨响琴弦。";
+    return;
+  }
+  if (Math.abs(cents.value) <= 5) {
+    statusLine.value = "音准稳定在目标附近。";
+    return;
+  }
+  statusLine.value =
+    cents.value < 0 ? "琴弦偏低，稍微拧紧。" : "琴弦偏高，稍微放松。";
+}
+
+function resetPitch() {
+  detectedFrequency.value = null;
+}
+
+function frequencyToNote(frequency) {
+  const noteNumber = Math.round(12 * Math.log2(frequency / 440) + 69);
+  const octave = Math.floor(noteNumber / 12) - 1;
+  return `${noteNames[noteNumber % 12]}${octave}`;
+}
+
+onBeforeUnmount(() => {
+  if (audioState.running) stopTuner();
+});
+</script>
+
+<template>
+  <main class="app-shell">
+    <section
+      class="tuner-panel"
+      :class="tunerStateClass"
+      aria-label="guitar tuner"
+    >
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Anything Tuner</p>
+        </div>
+        <button
+          class="icon-button"
+          type="button"
+          :aria-pressed="audioState.running"
+          :disabled="!isSupported"
+          @click="toggleTuner"
+        >
+          <span class="mic-icon" aria-hidden="true"></span>
+          <span>{{ audioState.running ? "停止调音" : "开始调音" }}</span>
+        </button>
+      </header>
+
+      <div class="status-line" role="status">{{ statusLine }}</div>
+
+      <section class="readout" aria-live="polite">
+        <div class="meter" aria-hidden="true">
+          <div class="meter-status">{{ centsText }}</div>
+          <div class="meter-arc"></div>
+          <div class="meter-safe-zone"></div>
+          <div class="meter-ticks">
+            <span
+              v-for="tick in meterTicks"
+              :key="tick"
+              :style="{ '--tick-angle': `${(tick / 50) * 50}deg` }"
+            ></span>
+          </div>
+          <div class="meter-band">
+            <span
+              v-for="tick in meterTicks"
+              :key="`label-${tick}`"
+              :style="{ '--label-angle': `${(tick / 50) * 50}deg` }"
+            >
+              {{ tick > 0 ? `+${tick}` : tick }}
+            </span>
+          </div>
+          <div class="meter-center">
+            <span>目标 {{ targetNote }}</span>
+            <strong>{{ detectedNote }}</strong>
+          </div>
+          <div class="needle" :style="needleStyle"></div>
+          <div class="needle-pivot"></div>
+        </div>
+        <div class="note-card">
+          <div class="target-note">{{ targetNote }}</div>
+          <div class="detected-note">{{ detectedNote }}</div>
+          <div class="cents">{{ centsText }}</div>
+        </div>
+        <div class="mobile-frequency-strip" aria-label="频率信息">
+          <div>
+            <span>当前</span>
+            <strong>{{ frequencyText }}</strong>
+          </div>
+          <div>
+            <span>目标</span>
+            <strong>{{ targetFrequencyText }}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="controls" aria-label="调音设置">
+        <label class="select-label" for="tuningSelect">调弦</label>
+        <select id="tuningSelect" v-model.number="activeTuningIndex">
+          <option
+            v-for="(tuning, index) in tunings"
+            :key="tuning.name"
+            :value="index"
+          >
+            {{ tuning.name }}
+          </option>
+        </select>
+
+        <div class="string-list" aria-label="琴弦">
+          <button
+            v-for="([note, frequency], index) in activeTuning.strings"
+            :key="`${note}-${frequency}`"
+            class="string-button"
+            :class="{ active: index === activeStringIndex }"
+            type="button"
+            @click="activeStringIndex = index"
+          >
+            <strong>{{ note }}</strong>
+            <span>
+              {{ activeTuning.strings.length - index }} 弦 ·
+              {{ frequency.toFixed(2) }} Hz
+            </span>
+          </button>
+        </div>
+      </section>
+    </section>
+
+    <aside class="side-panel" aria-label="使用状态">
+      <div class="frequency-card">
+        <span>当前频率</span>
+        <strong>{{ frequencyText }}</strong>
+      </div>
+      <div class="frequency-card">
+        <span>目标频率</span>
+        <strong>{{ targetFrequencyText }}</strong>
+      </div>
+      <div class="tips">
+        <h2>常用调弦</h2>
+        <p>
+          内置标准、降 D、全降半音、全降一音、开放
+          G、DADGAD，适合电吉他和木吉他。
+        </p>
+      </div>
+    </aside>
+  </main>
+</template>
