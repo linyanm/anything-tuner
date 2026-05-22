@@ -137,6 +137,9 @@ const frequencyText = computed(() =>
 const targetFrequencyText = computed(
   () => `${targetFrequency.value.toFixed(2)} Hz`,
 );
+const selectedStringLabel = computed(
+  () => `${activeTuning.value.strings.length - activeStringIndex.value} 弦`,
+);
 const inputLevelText = computed(() => `${Math.round(inputLevel.value * 100)}%`);
 const inputLevelStyle = computed(() => ({
   transform: `scaleX(${inputLevel.value})`,
@@ -151,9 +154,33 @@ const cents = computed(() => {
   if (!detectedFrequency.value) return null;
   return 1200 * Math.log2(detectedFrequency.value / targetFrequency.value);
 });
+const closestString = computed(() => {
+  if (!detectedFrequency.value) return null;
+
+  return activeTuning.value.strings
+    .map(([note, frequency], index) => ({
+      note,
+      frequency,
+      index,
+      label: `${activeTuning.value.strings.length - index} 弦`,
+      cents: Math.abs(1200 * Math.log2(detectedFrequency.value / frequency)),
+    }))
+    .sort((stringA, stringB) => stringA.cents - stringB.cents)[0];
+});
+const isDifferentString = computed(() => {
+  if (!closestString.value || cents.value === null) return false;
+  return (
+    closestString.value.index !== activeStringIndex.value &&
+    closestString.value.cents <= 65 &&
+    Math.abs(cents.value) >= 180
+  );
+});
 const centsText = computed(() => {
   if (cents.value === null)
     return audioState.running ? "请拨响琴弦" : "等待输入";
+  if (isDifferentString.value) {
+    return `疑似 ${closestString.value.label} ${closestString.value.note}`;
+  }
   const absCents = Math.abs(cents.value);
   if (absCents <= 5) return "已调准";
   return cents.value < 0
@@ -253,6 +280,7 @@ function tick(timestamp = performance.now()) {
       audioState.buffer,
       audioState.context.sampleRate,
       targetFrequency.value,
+      activeTuning.value.strings,
     );
     inputLevel.value = pitch.level;
     pitchConfidence.value = pitch.confidence;
@@ -280,7 +308,7 @@ function getInputGain() {
   return isSafari ? 18 : 3;
 }
 
-function detectPitch(buffer, sampleRate, targetFrequencyValue) {
+function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
   const workingBuffer = new Float32Array(buffer.length);
   let mean = 0;
   for (const sample of buffer) {
@@ -359,28 +387,96 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue) {
       candidates.push({
         frequency,
         confidence: normalizedCorrelation,
+        lag: refinedLag,
         centsFromTarget: Math.abs(
           1200 * Math.log2(frequency / targetFrequencyValue),
         ),
+        centsFromTuning: getClosestTuningDistance(frequency, tuningStrings),
       });
     }
   }
 
   if (!candidates.length) return { frequency: null, confidence: 0, level };
 
-  candidates.sort((candidateA, candidateB) => {
-    const targetDifference =
-      candidateA.centsFromTarget - candidateB.centsFromTarget;
-    if (Math.abs(targetDifference) > 12) return targetDifference;
-    return candidateB.confidence - candidateA.confidence;
-  });
-
-  const bestCandidate = candidates[0];
+  const bestCandidate = choosePitchCandidate(
+    candidates,
+    targetFrequencyValue,
+    minimumCorrelation,
+  );
   return {
     frequency: bestCandidate.frequency,
     confidence: bestCandidate.confidence,
     level,
   };
+}
+
+function getClosestTuningDistance(frequency, tuningStrings) {
+  return Math.min(
+    ...tuningStrings.map(([, stringFrequency]) =>
+      Math.abs(1200 * Math.log2(frequency / stringFrequency)),
+    ),
+  );
+}
+
+function choosePitchCandidate(
+  candidates,
+  targetFrequencyValue,
+  minimumCorrelation,
+) {
+  const strongestCandidate = candidates.reduce((bestCandidate, candidate) =>
+    candidate.confidence > bestCandidate.confidence ? candidate : bestCandidate,
+  );
+  const targetCandidate = candidates
+    .filter((candidate) => candidate.centsFromTarget <= 80)
+    .sort((candidateA, candidateB) => {
+      const confidenceDifference =
+        candidateB.confidence - candidateA.confidence;
+      if (Math.abs(confidenceDifference) > 0.02) return confidenceDifference;
+      return candidateA.centsFromTarget - candidateB.centsFromTarget;
+    })[0];
+  const tuningCandidate = candidates
+    .filter((candidate) => candidate.centsFromTuning <= 80)
+    .sort((candidateA, candidateB) => {
+      const tuningDistanceDifference =
+        candidateA.centsFromTuning - candidateB.centsFromTuning;
+      if (Math.abs(tuningDistanceDifference) > 12) {
+        return tuningDistanceDifference;
+      }
+      return candidateB.confidence - candidateA.confidence;
+    })[0];
+
+  if (
+    targetCandidate &&
+    targetCandidate.confidence >=
+      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.82) &&
+    getOctaveDistanceInCents(
+      strongestCandidate.frequency,
+      targetFrequencyValue,
+    ) <= 90
+  ) {
+    return targetCandidate;
+  }
+
+  if (
+    tuningCandidate &&
+    tuningCandidate !== strongestCandidate &&
+    tuningCandidate.confidence >=
+      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.72) &&
+    getOctaveDistanceInCents(
+      tuningCandidate.frequency,
+      strongestCandidate.frequency,
+    ) <= 80
+  ) {
+    return tuningCandidate;
+  }
+
+  return strongestCandidate;
+}
+
+function getOctaveDistanceInCents(frequencyA, frequencyB) {
+  const absoluteCents = Math.abs(1200 * Math.log2(frequencyA / frequencyB));
+  const octaveRemainder = absoluteCents % 1200;
+  return Math.min(octaveRemainder, 1200 - octaveRemainder);
 }
 
 function updateNoiseFloor(rms) {
@@ -439,6 +535,10 @@ function updateStatusFromPitch() {
       inputLevel.value > 0.04
         ? "已收到声音，但音高不稳定。请靠近麦克风并单独拨响当前琴弦。"
         : "请拨响琴弦。";
+    return;
+  }
+  if (isDifferentString.value) {
+    statusLine.value = `检测到 ${closestString.value.label} ${closestString.value.note}，不是当前选择的 ${selectedStringLabel.value} ${targetNote.value}。`;
     return;
   }
   if (Math.abs(cents.value) <= 5) {
