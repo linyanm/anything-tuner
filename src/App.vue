@@ -86,8 +86,13 @@ const noteNames = [
 ];
 const meterTicks = [-50, -25, 0, 25, 50];
 const githubUrl = "https://github.com/linyanm/anything-tuner";
-const minimumSignalRms = 0.0025;
-const comfortableSignalRms = 0.04;
+const minimumSignalRms = 0.0008;
+const defaultNoiseFloor = 0.00035;
+const comfortableSignalRms = 0.03;
+const browserUserAgent = navigator.userAgent.toLowerCase();
+const isSafari =
+  browserUserAgent.includes("safari") &&
+  !/(chrome|chromium|crios|fxios|edg|android)/.test(browserUserAgent);
 const headstockLayout = [
   { side: "left", slot: 2, x: -104 },
   { side: "left", slot: 1, x: -104 },
@@ -108,11 +113,13 @@ const audioState = reactive({
   context: null,
   analyser: null,
   source: null,
+  preamp: null,
   stream: null,
   buffer: null,
   rafId: null,
   lastAnalysisTime: 0,
   missedAnalyses: 0,
+  noiseFloor: defaultNoiseFloor,
   running: false,
 });
 
@@ -188,12 +195,7 @@ async function toggleTuner() {
 async function startTuner() {
   try {
     audioState.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: true,
-        channelCount: 1,
-      },
+      audio: getAudioConstraints(),
     });
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     audioState.context = new AudioContextClass();
@@ -208,11 +210,15 @@ async function startTuner() {
     audioState.source = audioState.context.createMediaStreamSource(
       audioState.stream,
     );
-    audioState.source.connect(audioState.analyser);
+    audioState.preamp = audioState.context.createGain();
+    audioState.preamp.gain.value = getInputGain();
+    audioState.source.connect(audioState.preamp);
+    audioState.preamp.connect(audioState.analyser);
 
     audioState.running = true;
     audioState.lastAnalysisTime = 0;
     audioState.missedAnalyses = 0;
+    audioState.noiseFloor = defaultNoiseFloor;
     statusLine.value = "正在监听琴弦声音。";
     tick();
   } catch (error) {
@@ -229,8 +235,10 @@ function stopTuner() {
   audioState.context = null;
   audioState.analyser = null;
   audioState.source = null;
+  audioState.preamp = null;
   audioState.lastAnalysisTime = 0;
   audioState.missedAnalyses = 0;
+  audioState.noiseFloor = defaultNoiseFloor;
   inputLevel.value = 0;
   statusLine.value = "已停止监听。";
   resetPitch();
@@ -254,6 +262,24 @@ function tick(timestamp = performance.now()) {
   audioState.rafId = requestAnimationFrame(tick);
 }
 
+function getAudioConstraints() {
+  const supportedConstraints = navigator.mediaDevices.getSupportedConstraints();
+  const constraints = {};
+
+  if (supportedConstraints.echoCancellation)
+    constraints.echoCancellation = false;
+  if (supportedConstraints.noiseSuppression)
+    constraints.noiseSuppression = false;
+  if (supportedConstraints.autoGainControl) constraints.autoGainControl = true;
+  if (supportedConstraints.channelCount) constraints.channelCount = 1;
+
+  return constraints;
+}
+
+function getInputGain() {
+  return isSafari ? 10 : 3;
+}
+
 function detectPitch(buffer, sampleRate, targetFrequencyValue) {
   const workingBuffer = new Float32Array(buffer.length);
   let mean = 0;
@@ -270,7 +296,10 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue) {
   }
   rms = Math.sqrt(rms / buffer.length);
   const level = Math.min(1, rms / comfortableSignalRms);
-  if (rms < minimumSignalRms) return { frequency: null, confidence: 0, level };
+  updateNoiseFloor(rms);
+
+  const signalGate = Math.max(minimumSignalRms, audioState.noiseFloor * 2.2);
+  if (rms < signalGate) return { frequency: null, confidence: 0, level };
 
   for (let index = 0; index < workingBuffer.length; index += 1) {
     workingBuffer[index] /= rms;
@@ -354,10 +383,23 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue) {
   };
 }
 
+function updateNoiseFloor(rms) {
+  const currentFloor = audioState.noiseFloor || defaultNoiseFloor;
+  if (rms < currentFloor * 1.8) {
+    audioState.noiseFloor = currentFloor * 0.94 + rms * 0.06;
+    return;
+  }
+
+  audioState.noiseFloor = Math.max(
+    defaultNoiseFloor,
+    Math.min(currentFloor * 1.01, currentFloor + 0.00002),
+  );
+}
+
 function getMinimumCorrelation(rms) {
-  if (rms < 0.006) return 0.46;
-  if (rms < 0.012) return 0.52;
-  if (rms < 0.02) return 0.58;
+  if (rms < 0.004) return 0.42;
+  if (rms < 0.008) return 0.48;
+  if (rms < 0.016) return 0.56;
   return 0.62;
 }
 
