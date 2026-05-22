@@ -89,6 +89,11 @@ const githubUrl = "https://github.com/linyanm/anything-tuner";
 const minimumSignalRms = 0.0008;
 const defaultNoiseFloor = 0.00035;
 const comfortableSignalRms = 0.024;
+const pitchHoldDuration = 1800;
+const tunedStableDuration = 500;
+const targetLockWindow = 45;
+const targetOutlierWindow = 140;
+const targetLockDuration = 1200;
 const browserUserAgent = navigator.userAgent.toLowerCase();
 const isSafari =
   browserUserAgent.includes("safari") &&
@@ -108,6 +113,7 @@ const statusLine = ref("选择调弦后点击开始，允许浏览器使用麦�
 const detectedFrequency = ref(null);
 const inputLevel = ref(0);
 const pitchConfidence = ref(0);
+const isTunedStable = ref(false);
 const isSupported = Boolean(navigator.mediaDevices?.getUserMedia);
 const audioState = reactive({
   context: null,
@@ -118,6 +124,9 @@ const audioState = reactive({
   buffer: null,
   rafId: null,
   lastAnalysisTime: 0,
+  lastReliablePitchTime: 0,
+  targetLockUntil: 0,
+  tunedSinceTime: 0,
   missedAnalyses: 0,
   noiseFloor: defaultNoiseFloor,
   running: false,
@@ -182,14 +191,14 @@ const centsText = computed(() => {
     return `疑似 ${closestString.value.label} ${closestString.value.note}`;
   }
   const absCents = Math.abs(cents.value);
-  if (absCents <= 5) return "已调准";
+  if (absCents <= 5) return isTunedStable.value ? "已调准" : "保持中";
   return cents.value < 0
     ? `偏低 ${Math.round(absCents)} cents`
     : `偏高 ${Math.round(absCents)} cents`;
 });
 const tunerStateClass = computed(() => {
   if (cents.value === null) return "";
-  if (Math.abs(cents.value) <= 5) return "is-good";
+  if (Math.abs(cents.value) <= 5 && isTunedStable.value) return "is-good";
   return cents.value < 0 ? "is-flat" : "is-sharp";
 });
 const needleStyle = computed(() => {
@@ -244,6 +253,9 @@ async function startTuner() {
 
     audioState.running = true;
     audioState.lastAnalysisTime = 0;
+    audioState.lastReliablePitchTime = 0;
+    audioState.targetLockUntil = 0;
+    audioState.tunedSinceTime = 0;
     audioState.missedAnalyses = 0;
     audioState.noiseFloor = defaultNoiseFloor;
     statusLine.value = "正在监听琴弦声音。";
@@ -264,6 +276,9 @@ function stopTuner() {
   audioState.source = null;
   audioState.preamp = null;
   audioState.lastAnalysisTime = 0;
+  audioState.lastReliablePitchTime = 0;
+  audioState.targetLockUntil = 0;
+  audioState.tunedSinceTime = 0;
   audioState.missedAnalyses = 0;
   audioState.noiseFloor = defaultNoiseFloor;
   inputLevel.value = 0;
@@ -281,10 +296,16 @@ function tick(timestamp = performance.now()) {
       audioState.context.sampleRate,
       targetFrequency.value,
       activeTuning.value.strings,
+      activeStringIndex.value,
     );
     inputLevel.value = pitch.level;
     pitchConfidence.value = pitch.confidence;
-    detectedFrequency.value = smoothDetectedFrequency(pitch.frequency);
+    const stablePitch = filterTargetOutlier(pitch.frequency, timestamp);
+    detectedFrequency.value = smoothDetectedFrequency(
+      stablePitch.frequency,
+      timestamp,
+    );
+    updateTunedStability(stablePitch.isFresh, timestamp);
     updateStatusFromPitch();
   }
   audioState.rafId = requestAnimationFrame(tick);
@@ -308,7 +329,13 @@ function getInputGain() {
   return isSafari ? 18 : 3;
 }
 
-function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
+function detectPitch(
+  buffer,
+  sampleRate,
+  targetFrequencyValue,
+  tuningStrings,
+  targetStringIndex,
+) {
   const workingBuffer = new Float32Array(buffer.length);
   let mean = 0;
   for (const sample of buffer) {
@@ -384,6 +411,10 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
           : 0;
       const refinedLag = lag + Math.max(-0.5, Math.min(0.5, shift));
       const frequency = sampleRate / refinedLag;
+      const closestTuningMatch = getClosestTuningMatch(
+        frequency,
+        tuningStrings,
+      );
       candidates.push({
         frequency,
         confidence: normalizedCorrelation,
@@ -391,7 +422,8 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
         centsFromTarget: Math.abs(
           1200 * Math.log2(frequency / targetFrequencyValue),
         ),
-        centsFromTuning: getClosestTuningDistance(frequency, tuningStrings),
+        centsFromTuning: closestTuningMatch.cents,
+        closestTuningIndex: closestTuningMatch.index,
       });
     }
   }
@@ -402,6 +434,7 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
     candidates,
     targetFrequencyValue,
     minimumCorrelation,
+    targetStringIndex,
   );
   return {
     frequency: bestCandidate.frequency,
@@ -410,18 +443,20 @@ function detectPitch(buffer, sampleRate, targetFrequencyValue, tuningStrings) {
   };
 }
 
-function getClosestTuningDistance(frequency, tuningStrings) {
-  return Math.min(
-    ...tuningStrings.map(([, stringFrequency]) =>
-      Math.abs(1200 * Math.log2(frequency / stringFrequency)),
-    ),
-  );
+function getClosestTuningMatch(frequency, tuningStrings) {
+  return tuningStrings
+    .map(([, stringFrequency], index) => ({
+      index,
+      cents: Math.abs(1200 * Math.log2(frequency / stringFrequency)),
+    }))
+    .sort((matchA, matchB) => matchA.cents - matchB.cents)[0];
 }
 
 function choosePitchCandidate(
   candidates,
   targetFrequencyValue,
   minimumCorrelation,
+  targetStringIndex,
 ) {
   const strongestCandidate = candidates.reduce((bestCandidate, candidate) =>
     candidate.confidence > bestCandidate.confidence ? candidate : bestCandidate,
@@ -444,6 +479,24 @@ function choosePitchCandidate(
       }
       return candidateB.confidence - candidateA.confidence;
     })[0];
+  const differentStringCandidate = candidates
+    .filter(
+      (candidate) =>
+        candidate.closestTuningIndex !== targetStringIndex &&
+        candidate.centsFromTuning <= 80 &&
+        candidate.centsFromTarget >= 180,
+    )
+    .sort(
+      (candidateA, candidateB) => candidateB.confidence - candidateA.confidence,
+    )[0];
+
+  if (
+    differentStringCandidate &&
+    differentStringCandidate.confidence >=
+      Math.max(minimumCorrelation, strongestCandidate.confidence * 0.9)
+  ) {
+    return differentStringCandidate;
+  }
 
   if (
     targetCandidate &&
@@ -499,13 +552,55 @@ function getMinimumCorrelation(rms) {
   return 0.62;
 }
 
-function smoothDetectedFrequency(frequency) {
+function filterTargetOutlier(frequency, timestamp) {
+  if (!frequency) return { frequency: null, isFresh: false };
+
+  const centsFromTarget = Math.abs(
+    1200 * Math.log2(frequency / targetFrequency.value),
+  );
+  const currentCentsFromTarget = detectedFrequency.value
+    ? Math.abs(
+        1200 * Math.log2(detectedFrequency.value / targetFrequency.value),
+      )
+    : Number.POSITIVE_INFINITY;
+  const closestTuningMatch = getClosestTuningMatch(
+    frequency,
+    activeTuning.value.strings,
+  );
+
+  if (
+    closestTuningMatch.index !== activeStringIndex.value &&
+    closestTuningMatch.cents <= 65
+  ) {
+    return { frequency, isFresh: true };
+  }
+
+  if (centsFromTarget <= targetLockWindow) {
+    audioState.targetLockUntil = timestamp + targetLockDuration;
+    return { frequency, isFresh: true };
+  }
+
+  if (
+    currentCentsFromTarget <= targetLockWindow &&
+    centsFromTarget >= targetOutlierWindow &&
+    timestamp <= audioState.targetLockUntil
+  ) {
+    return { frequency: detectedFrequency.value, isFresh: false };
+  }
+
+  return { frequency, isFresh: true };
+}
+
+function smoothDetectedFrequency(frequency, timestamp) {
   if (!frequency) {
     audioState.missedAnalyses += 1;
-    return audioState.missedAnalyses <= 3 ? detectedFrequency.value : null;
+    return timestamp - audioState.lastReliablePitchTime <= pitchHoldDuration
+      ? detectedFrequency.value
+      : null;
   }
 
   audioState.missedAnalyses = 0;
+  audioState.lastReliablePitchTime = timestamp;
   if (!detectedFrequency.value) return frequency;
 
   const distanceInCents = Math.abs(
@@ -529,6 +624,31 @@ function normalizedCorrelationForLag(buffer, lag) {
   return energy > 0 ? (2 * correlation) / energy : 0;
 }
 
+function updateTunedStability(hasFreshPitch, timestamp) {
+  if (!hasFreshPitch || cents.value === null || isDifferentString.value) {
+    if (timestamp - audioState.lastReliablePitchTime > pitchHoldDuration) {
+      isTunedStable.value = false;
+      audioState.tunedSinceTime = 0;
+    }
+    return;
+  }
+
+  if (Math.abs(cents.value) > 5) {
+    isTunedStable.value = false;
+    audioState.tunedSinceTime = 0;
+    return;
+  }
+
+  if (!audioState.tunedSinceTime) {
+    audioState.tunedSinceTime = timestamp;
+    isTunedStable.value = false;
+    return;
+  }
+
+  isTunedStable.value =
+    timestamp - audioState.tunedSinceTime >= tunedStableDuration;
+}
+
 function updateStatusFromPitch() {
   if (cents.value === null) {
     statusLine.value =
@@ -542,7 +662,9 @@ function updateStatusFromPitch() {
     return;
   }
   if (Math.abs(cents.value) <= 5) {
-    statusLine.value = "音准稳定在目标附近。";
+    statusLine.value = isTunedStable.value
+      ? "音准稳定在目标附近。"
+      : "音准已接近目标，请保持声音稳定。";
     return;
   }
   statusLine.value =
@@ -552,6 +674,10 @@ function updateStatusFromPitch() {
 function resetPitch() {
   detectedFrequency.value = null;
   pitchConfidence.value = 0;
+  isTunedStable.value = false;
+  audioState.lastReliablePitchTime = 0;
+  audioState.targetLockUntil = 0;
+  audioState.tunedSinceTime = 0;
   audioState.missedAnalyses = 0;
 }
 
