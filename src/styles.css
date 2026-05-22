@@ -197,6 +197,35 @@ h1 {
   font-size: 0.95rem;
 }
 
+.input-monitor {
+  min-height: 30px;
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.input-meter {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(30 37 40 / 10%);
+}
+
+.input-meter span {
+  width: 100%;
+  height: 100%;
+  display: block;
+  transform-origin: left center;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--flat), var(--accent), var(--warm));
+  transition: transform 80ms linear;
+}
+
 .headstock-preview {
   display: grid;
   place-items: center;
@@ -822,6 +851,17 @@ select {
   .status-line {
     margin-top: 12px;
     font-size: 0.88rem;
+  }
+
+  .input-monitor {
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    font-size: 0.76rem;
+  }
+
+  .input-meter {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 
   .note-card {

@@ -86,6 +86,8 @@ const noteNames = [
 ];
 const meterTicks = [-50, -25, 0, 25, 50];
 const githubUrl = "https://github.com/linyanm/anything-tuner";
+const minimumSignalRms = 0.0025;
+const comfortableSignalRms = 0.04;
 const headstockLayout = [
   { side: "left", slot: 2, x: -104 },
   { side: "left", slot: 1, x: -104 },
@@ -99,13 +101,18 @@ const activeTuningIndex = ref(0);
 const activeStringIndex = ref(0);
 const statusLine = ref("选择调弦后点击开始，允许浏览器使用麦克风。");
 const detectedFrequency = ref(null);
+const inputLevel = ref(0);
+const pitchConfidence = ref(0);
 const isSupported = Boolean(navigator.mediaDevices?.getUserMedia);
 const audioState = reactive({
   context: null,
   analyser: null,
+  source: null,
   stream: null,
   buffer: null,
   rafId: null,
+  lastAnalysisTime: 0,
+  missedAnalyses: 0,
   running: false,
 });
 
@@ -122,6 +129,13 @@ const frequencyText = computed(() =>
 );
 const targetFrequencyText = computed(
   () => `${targetFrequency.value.toFixed(2)} Hz`,
+);
+const inputLevelText = computed(() => `${Math.round(inputLevel.value * 100)}%`);
+const inputLevelStyle = computed(() => ({
+  transform: `scaleX(${inputLevel.value})`,
+}));
+const confidenceText = computed(() =>
+  pitchConfidence.value ? `${Math.round(pitchConfidence.value * 100)}%` : "--",
 );
 const detectedNote = computed(() =>
   detectedFrequency.value ? frequencyToNote(detectedFrequency.value) : "--",
@@ -177,20 +191,28 @@ async function startTuner() {
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
-        autoGainControl: false,
+        autoGainControl: true,
+        channelCount: 1,
       },
     });
-    audioState.context = new AudioContext();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    audioState.context = new AudioContextClass();
+    if (audioState.context.state === "suspended") {
+      await audioState.context.resume();
+    }
     audioState.analyser = audioState.context.createAnalyser();
-    audioState.analyser.fftSize = 4096;
+    audioState.analyser.fftSize = 8192;
+    audioState.analyser.smoothingTimeConstant = 0;
     audioState.buffer = new Float32Array(audioState.analyser.fftSize);
 
-    const source = audioState.context.createMediaStreamSource(
+    audioState.source = audioState.context.createMediaStreamSource(
       audioState.stream,
     );
-    source.connect(audioState.analyser);
+    audioState.source.connect(audioState.analyser);
 
     audioState.running = true;
+    audioState.lastAnalysisTime = 0;
+    audioState.missedAnalyses = 0;
     statusLine.value = "正在监听琴弦声音。";
     tick();
   } catch (error) {
@@ -206,58 +228,175 @@ function stopTuner() {
   audioState.stream = null;
   audioState.context = null;
   audioState.analyser = null;
+  audioState.source = null;
+  audioState.lastAnalysisTime = 0;
+  audioState.missedAnalyses = 0;
+  inputLevel.value = 0;
   statusLine.value = "已停止监听。";
   resetPitch();
 }
 
-function tick() {
+function tick(timestamp = performance.now()) {
   if (!audioState.running || !audioState.analyser) return;
-  audioState.analyser.getFloatTimeDomainData(audioState.buffer);
-  detectedFrequency.value = detectPitch(
-    audioState.buffer,
-    audioState.context.sampleRate,
-  );
-  updateStatusFromPitch();
+  if (timestamp - audioState.lastAnalysisTime >= 45) {
+    audioState.lastAnalysisTime = timestamp;
+    audioState.analyser.getFloatTimeDomainData(audioState.buffer);
+    const pitch = detectPitch(
+      audioState.buffer,
+      audioState.context.sampleRate,
+      targetFrequency.value,
+    );
+    inputLevel.value = pitch.level;
+    pitchConfidence.value = pitch.confidence;
+    detectedFrequency.value = smoothDetectedFrequency(pitch.frequency);
+    updateStatusFromPitch();
+  }
   audioState.rafId = requestAnimationFrame(tick);
 }
 
-function detectPitch(buffer, sampleRate) {
-  let rms = 0;
+function detectPitch(buffer, sampleRate, targetFrequencyValue) {
+  const workingBuffer = new Float32Array(buffer.length);
+  let mean = 0;
   for (const sample of buffer) {
-    rms += sample * sample;
+    mean += sample;
+  }
+  mean /= buffer.length;
+
+  let rms = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    const centeredSample = buffer[index] - mean;
+    workingBuffer[index] = centeredSample;
+    rms += centeredSample * centeredSample;
   }
   rms = Math.sqrt(rms / buffer.length);
-  if (rms < 0.01) return null;
+  const level = Math.min(1, rms / comfortableSignalRms);
+  if (rms < minimumSignalRms) return { frequency: null, confidence: 0, level };
 
-  const minFrequency = 60;
-  const maxFrequency = 380;
+  for (let index = 0; index < workingBuffer.length; index += 1) {
+    workingBuffer[index] /= rms;
+  }
+
+  const minFrequency = 55;
+  const maxFrequency = 430;
+  const minimumCorrelation = getMinimumCorrelation(rms);
   const minLag = Math.floor(sampleRate / maxFrequency);
   const maxLag = Math.min(
     buffer.length - 1,
     Math.ceil(sampleRate / minFrequency),
   );
-  let bestLag = -1;
-  let bestCorrelation = 0;
+  const candidates = [];
 
   for (let lag = minLag; lag <= maxLag; lag += 1) {
     let correlation = 0;
-    for (let index = 0; index < buffer.length - lag; index += 1) {
-      correlation += buffer[index] * buffer[index + lag];
+    let energy = 0;
+    const compareLength = buffer.length - lag;
+    for (let index = 0; index < compareLength; index += 1) {
+      const sampleA = workingBuffer[index];
+      const sampleB = workingBuffer[index + lag];
+      correlation += sampleA * sampleB;
+      energy += sampleA * sampleA + sampleB * sampleB;
     }
-    correlation /= buffer.length - lag;
-    if (correlation > bestCorrelation) {
-      bestCorrelation = correlation;
-      bestLag = lag;
+
+    const normalizedCorrelation = energy > 0 ? (2 * correlation) / energy : 0;
+    if (normalizedCorrelation < minimumCorrelation) continue;
+
+    const previousLag = Math.max(minLag, lag - 1);
+    const nextLag = Math.min(maxLag, lag + 1);
+    let previousCorrelation = normalizedCorrelation;
+    let nextCorrelation = normalizedCorrelation;
+
+    if (previousLag !== lag) {
+      previousCorrelation = normalizedCorrelationForLag(
+        workingBuffer,
+        previousLag,
+      );
+    }
+    if (nextLag !== lag) {
+      nextCorrelation = normalizedCorrelationForLag(workingBuffer, nextLag);
+    }
+
+    if (
+      normalizedCorrelation >= previousCorrelation &&
+      normalizedCorrelation >= nextCorrelation
+    ) {
+      const denominator =
+        previousCorrelation - 2 * normalizedCorrelation + nextCorrelation;
+      const shift =
+        Math.abs(denominator) > 0.000001
+          ? (previousCorrelation - nextCorrelation) / (2 * denominator)
+          : 0;
+      const refinedLag = lag + Math.max(-0.5, Math.min(0.5, shift));
+      const frequency = sampleRate / refinedLag;
+      candidates.push({
+        frequency,
+        confidence: normalizedCorrelation,
+        centsFromTarget: Math.abs(
+          1200 * Math.log2(frequency / targetFrequencyValue),
+        ),
+      });
     }
   }
 
-  if (bestLag <= 0 || bestCorrelation < 0.002) return null;
-  return sampleRate / bestLag;
+  if (!candidates.length) return { frequency: null, confidence: 0, level };
+
+  candidates.sort((candidateA, candidateB) => {
+    const targetDifference =
+      candidateA.centsFromTarget - candidateB.centsFromTarget;
+    if (Math.abs(targetDifference) > 12) return targetDifference;
+    return candidateB.confidence - candidateA.confidence;
+  });
+
+  const bestCandidate = candidates[0];
+  return {
+    frequency: bestCandidate.frequency,
+    confidence: bestCandidate.confidence,
+    level,
+  };
+}
+
+function getMinimumCorrelation(rms) {
+  if (rms < 0.006) return 0.46;
+  if (rms < 0.012) return 0.52;
+  if (rms < 0.02) return 0.58;
+  return 0.62;
+}
+
+function smoothDetectedFrequency(frequency) {
+  if (!frequency) {
+    audioState.missedAnalyses += 1;
+    return audioState.missedAnalyses <= 3 ? detectedFrequency.value : null;
+  }
+
+  audioState.missedAnalyses = 0;
+  if (!detectedFrequency.value) return frequency;
+
+  const distanceInCents = Math.abs(
+    1200 * Math.log2(frequency / detectedFrequency.value),
+  );
+  if (distanceInCents > 40) return frequency;
+
+  return detectedFrequency.value * 0.55 + frequency * 0.45;
+}
+
+function normalizedCorrelationForLag(buffer, lag) {
+  let correlation = 0;
+  let energy = 0;
+  const compareLength = buffer.length - lag;
+  for (let index = 0; index < compareLength; index += 1) {
+    const sampleA = buffer[index];
+    const sampleB = buffer[index + lag];
+    correlation += sampleA * sampleB;
+    energy += sampleA * sampleA + sampleB * sampleB;
+  }
+  return energy > 0 ? (2 * correlation) / energy : 0;
 }
 
 function updateStatusFromPitch() {
   if (cents.value === null) {
-    statusLine.value = "请拨响琴弦。";
+    statusLine.value =
+      inputLevel.value > 0.04
+        ? "已收到声音，但音高不稳定。请靠近麦克风并单独拨响当前琴弦。"
+        : "请拨响琴弦。";
     return;
   }
   if (Math.abs(cents.value) <= 5) {
@@ -270,6 +409,8 @@ function updateStatusFromPitch() {
 
 function resetPitch() {
   detectedFrequency.value = null;
+  pitchConfidence.value = 0;
+  audioState.missedAnalyses = 0;
 }
 
 function frequencyToNote(frequency) {
@@ -323,6 +464,13 @@ onBeforeUnmount(() => {
       </header>
 
       <div class="status-line" role="status">{{ statusLine }}</div>
+      <div class="input-monitor" aria-label="麦克风输入电平">
+        <span>输入 {{ inputLevelText }}</span>
+        <div class="input-meter" aria-hidden="true">
+          <span :style="inputLevelStyle"></span>
+        </div>
+        <span>置信度 {{ confidenceText }}</span>
+      </div>
 
       <section class="headstock-preview" aria-label="琴头预览">
         <div class="headstock">
