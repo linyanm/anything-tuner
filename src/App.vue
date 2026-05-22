@@ -86,6 +86,14 @@ const noteNames = [
 ];
 const meterTicks = [-50, -25, 0, 25, 50];
 const githubUrl = "https://github.com/linyanm/anything-tuner";
+const headstockLayout = [
+  { side: "left", slot: 2, x: -104 },
+  { side: "left", slot: 1, x: -104 },
+  { side: "left", slot: 0, x: -104 },
+  { side: "right", slot: 0, x: 104 },
+  { side: "right", slot: 1, x: 104 },
+  { side: "right", slot: 2, x: 104 },
+];
 
 const activeTuningIndex = ref(0);
 const activeStringIndex = ref(0);
@@ -315,6 +323,39 @@ onBeforeUnmount(() => {
       </header>
 
       <div class="status-line" role="status">{{ statusLine }}</div>
+
+      <section class="headstock-preview" aria-label="琴头预览">
+        <div class="headstock">
+          <div class="headstock-cap"></div>
+          <div class="headstock-neck"></div>
+          <button
+            v-for="([note, frequency], index) in activeTuning.strings"
+            :key="`headstock-${note}-${frequency}`"
+            class="headstock-string"
+            :class="{
+              active: index === activeStringIndex,
+              left: headstockLayout[index].side === 'left',
+              right: headstockLayout[index].side === 'right',
+            }"
+            type="button"
+            :style="{
+              '--string-index': index,
+              '--peg-slot': headstockLayout[index].slot,
+              '--peg-x': `${headstockLayout[index].x}px`,
+            }"
+            :aria-label="`选择第 ${activeTuning.strings.length - index} 弦 ${note}`"
+            @click="activeStringIndex = index"
+          >
+            <span class="string-line"></span>
+            <span class="tuning-peg">
+              <span class="peg-label">{{ note }}</span>
+              <span class="peg-number">
+                {{ activeTuning.strings.length - index }}
+              </span>
+            </span>
+          </button>
+        </div>
+      </section>
 
       <section class="readout" aria-live="polite">
         <div class="meter" aria-hidden="true">
