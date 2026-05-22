@@ -76,8 +76,14 @@ button:disabled {
   align-items: center;
 }
 
+.brand-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .eyebrow {
-  margin: 0 0 6px;
+  margin: 0;
   color: var(--accent);
   font-size: 0.82rem;
   font-weight: 800;
@@ -96,6 +102,41 @@ h1 {
   font-size: clamp(2.1rem, 6vw, 4.8rem);
   line-height: 0.95;
   letter-spacing: 0;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.source-link {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: white;
+  color: var(--ink);
+  text-decoration: none;
+  transition:
+    border-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.source-link:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.source-link svg {
+  width: 19px;
+  height: 19px;
+  fill: currentcolor;
 }
 
 .icon-button {
@@ -546,8 +587,16 @@ select {
     display: grid;
   }
 
+  .brand-row {
+    justify-content: space-between;
+  }
+
   .icon-button {
     width: 100%;
+  }
+
+  .header-actions {
+    display: block;
   }
 
   .meter {
